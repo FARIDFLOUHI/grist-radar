@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radar de couverture par BEF</title>
+<script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+<style>
+  :root { --ink:#1f2933; --muted:#6b7785; --grid:#d5dbe1; --bad:#c0392b; --bg:#ffffff; }
+  @media (prefers-color-scheme: dark) { :root { --ink:#e6eaee; --muted:#9aa5b1; --grid:#3b4653; --bad:#ff7b6b; --bg:#1b2229; } }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink); font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  #app { display:flex; flex-wrap:wrap; gap:12px 24px; align-items:center; justify-content:center; padding:12px 16px; box-sizing:border-box; min-height:100%; }
+  #chart { flex:1 1 380px; min-width:300px; max-width:640px; }
+  .head { flex:1 1 100%; text-align:center; margin:0 0 -4px; }
+  .head .kicker { font-size:15px; font-weight:600; color:#1b6ca8; margin-bottom:2px; }
+  .head h2 { margin:0; font-size:20px; font-weight:700; letter-spacing:-.3px; }
+  .head .sub { color:var(--muted); margin-top:2px; }
+  .dep { display:flex; align-items:baseline; gap:8px; margin:5px 0; }
+  .dep .pct { margin-left:auto; font-weight:700; font-variant-numeric:tabular-nums; }
+  .dep small { color:var(--muted); }
+  .note { color:var(--muted); font-size:12.5px; margin-top:10px; }
+  #chart svg { width:100%; height:auto; display:block; }
+  #side { flex:0 1 260px; min-width:200px; }
+  .score { font-size:28px; font-weight:700; letter-spacing:-.5px; }
+  .score small { font-size:14px; font-weight:400; color:var(--muted); }
+  .legend { list-style:none; margin:10px 0; padding:0; }
+  .legend li { display:flex; align-items:center; gap:8px; margin:4px 0; }
+  .sw { width:22px; height:0; border-top:3px solid; flex:none; }
+  .miss { color:var(--bad); font-weight:600; }
+  .part { color:#b36b00; font-weight:600; margin-bottom:4px; }
+  .ok { color:#2e7d4f; font-weight:600; }
+  #ver { display:none; position:fixed; right:8px; top:4px; z-index:5; font-size:10px; color:var(--muted); opacity:.6; }
+  #msg { text-align:center; color:var(--muted); padding:40px 16px; width:100%; }
+  svg text { fill:var(--ink); font-size:12.5px; }
+  svg text.gap { fill:var(--bad); font-weight:700; }
+</style>
+</head>
+<body>
+<div id="ver"></div>
+<div id="app"><div id="msg">Sélectionnez un BEF pour afficher sa couverture.</div></div>
+<script>
+// Toute colonne dont l'identifiant commence par "R_" devient un axe du radar (valeur 0/1).
+// Option &grille : radar de la grille d'évaluation (colonnes N_…, notes de 0 à 5) au lieu du radar de conformité (R_…)
+const GRILLE = /[?&]grille\b/.test(location.search);
+const PREFIX = GRILLE ? "N_" : "R_";
+const LABELS = {                       // libellés courts (facultatif : sinon l'identifiant est mis en forme)
+  R_Pole_Accueil: "Pôle d'accueil", R_MOREA_MOREX: "MOREA/MOREX", R_Accueil_multimodal: "Accueil multimodal",
+  R_Entrees_Sorties: "Entrées/sorties perm.", R_Sessions: "Sessions",
+  R_Professeurs: "Professeurs", R_AED: "AED", R_PSY_EN: "PSY-EN",
+  R_Entreprises: "Entreprises", R_Associations: "Associations", R_Autres: "Autres intervenants",
+  R_PSAD: "Préconisation PSAD",
+  N_Protocole: "Protocole d'évaluation", N_Pedagogique: "Travail pédagogique", N_Educatif: "Travail éducatif",
+  N_Construction: "Construction du projet", N_Artistique_Culturel: "Ouverture artistique et culturelle",
+  N_Sante_CPS: "Santé et CPS", N_Citoyennete: "Citoyenneté"
+};
+const COLORS = ["#1b6ca8", "#d9822b", "#3f9a6b", "#8a5aa8", "#b5485d", "#7a8b99"];
+const NS = "http://www.w3.org/2000/svg";
+
+// 1 = oui, 0,5 = partiellement, 0 = non
+const num = v => (v === true || v === "Oui") ? 1 : (v === "Partiellement" ? 0.5 : Math.min(1, Math.max(0, Number(v) || 0)));
+const label = k => LABELS[k] || k.slice(PREFIX.length).replace(/_/g, " ");
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+// Note de 0 à 5 ; case vide = non évalué (null)
+const note = v => { if (v === null || v === undefined || v === "") return null; const x = Number(String(v).replace(",", ".")); return isFinite(x) ? Math.min(5, Math.max(0, x)) : null; };
+const fmt = x => (Math.round(x * 10) / 10).toString().replace(".", ",");
+function renderGrille(records, opts) {
+  const single = !!opts.single, app = document.getElementById("app");
+  const axes = Object.keys(records[0]).filter(k => k.startsWith(PREFIX));
+  if (axes.length < 3) { app.innerHTML = '<div id="msg">Il faut au moins 3 colonnes dont l\'identifiant commence par « ' + PREFIX + ' » dans la table.</div>'; return; }
+  const n = axes.length, cx = 300, cy = 235, R = 150;
+  const ang = i => -Math.PI / 2 + (2 * Math.PI * i) / n;
+  const pt = (i, r) => [cx + r * Math.cos(ang(i)), cy + r * Math.sin(ang(i))];
+  const poly = vals => vals.map((v, i) => pt(i, R * v / 5).map(x => x.toFixed(1)).join(",")).join(" ");
+  const projects = records.map((r, idx) => ({ name: r.Legende || ("Projet " + (r.id ?? idx + 1)), raw: axes.map(a => note(r[a])), color: COLORS[idx % COLORS.length] }));
+  projects.forEach(p => p.vals = p.raw.map(v => v === null ? 0 : v));
+  const mean = axes.map((_, i) => { const l = projects.map(p => p.raw[i]).filter(v => v !== null); return l.length ? l.reduce((a, b) => a + b, 0) / l.length : null; });
+  const mv = mean.map(v => v === null ? 0 : v);
+  const rng = axes.map((_, i) => { const l = projects.map(p => p.raw[i]).filter(v => v !== null); return l.length ? [Math.min(...l), Math.max(...l)] : null; });
+  const rated = mean.filter(v => v !== null), avg = rated.length ? rated.reduce((a, b) => a + b, 0) / rated.length : null;
+  let g = '<svg viewBox="0 0 600 470" role="img" aria-label="Grille d\'évaluation, notes de 0 à 5">';
+  [1, 2, 3, 4, 5].forEach(f => { g += '<polygon points="' + poly(Array(n).fill(f)) + '" fill="none" stroke="var(--grid)"' + (f < 5 ? ' stroke-dasharray="3 4"' : '') + '/>'; });
+  axes.forEach((_, i) => { const [x, y] = pt(i, R); g += '<line x1="' + cx + '" y1="' + cy + '" x2="' + x.toFixed(1) + '" y2="' + y.toFixed(1) + '" stroke="var(--grid)"/>'; });
+  [1, 2, 3, 4, 5].forEach(f => { g += '<text x="' + (cx + 4) + '" y="' + (cy - R * f / 5 + 3).toFixed(1) + '" font-size="9" fill="#8a96a3">' + f + '</text>'; });
+  if (!single) projects.forEach(p => { g += '<polygon points="' + poly(p.vals) + '" fill="' + p.color + '" fill-opacity=".10" stroke="' + p.color + '" stroke-width="1.5" stroke-linejoin="round"/>'; });
+  if (single) g += '<polygon points="' + poly(mv) + '" fill="#1b6ca8" fill-opacity=".16" stroke="var(--ink)" stroke-width="3.2" stroke-linejoin="round"/>';
+  if (!single) projects.forEach(p => p.vals.forEach((v, i) => { const [x, y] = pt(i, R * v / 5); g += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.8" fill="' + p.color + '"/>'; }));
+  if (single) mv.forEach((v, i) => { const [x, y] = pt(i, R * v / 5); g += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="4.2" fill="' + (mean[i] === null ? 'var(--bg)' : 'var(--ink)') + '" stroke="' + (mean[i] === null ? 'var(--bad)' : 'var(--ink)') + '" stroke-width="2"/>'; });
+  axes.forEach((a, i) => {
+    const [x, y] = pt(i, R + 16), c = Math.cos(ang(i));
+    const anchor = Math.abs(c) < 0.2 ? "middle" : (c > 0 ? "start" : "end");
+    const dy = Math.sin(ang(i)) > 0.5 ? 10 : (Math.sin(ang(i)) < -0.5 ? -2 : 4);
+    g += '<text x="' + x.toFixed(1) + '" y="' + (y + dy).toFixed(1) + '" text-anchor="' + anchor + '"' + (mean[i] === null ? ' class="gap"' : '') + '>' + esc(label(a)) + (mean[i] === null ? ' ?' : (single ? ' ' + fmt(mean[i]) : (rng[i][0] === rng[i][1] ? ' ' + fmt(rng[i][0]) : ' ' + fmt(rng[i][0]) + '–' + fmt(rng[i][1])))) + '</text>';
+  });
+  g += '</svg>';
+  let side = single ? '<div class="score">' + (avg === null ? '–' : fmt(avg)) + '<small> / 5 · moyenne des critères</small></div>' : '<div class="score">' + records.length + '<small> projet' + (records.length > 1 ? 's' : '') + ' · notes de 0 à 5</small></div>';
+  if (!single) {
+    side += '<ul class="legend">';
+    projects.forEach(p => { side += '<li><span class="sw" style="border-color:' + p.color + '"></span>' + esc(p.name) + '</li>'; });
+    side += '</ul><div class="note">Sur chaque axe : note la plus basse – la plus haute des projets du BEF.</div>';
+  }
+  const low = axes.map((a, i) => [a, single ? mean[i] : (rng[i] ? rng[i][1] : null)]).filter(x => x[1] !== null && x[1] < 3).map(x => label(x[0]) + ' (' + fmt(x[1]) + ')');
+  const none = axes.filter((_, i) => mean[i] === null).map(label);
+  if (low.length) side += '<div class="miss">' + (single ? 'Points faibles (< 3) : ' : 'Aucun projet n\'atteint 3 : ') + low.map(esc).join(", ") + '</div>';
+  if (none.length) side += '<div class="part">Non évalués : ' + none.map(esc).join(", ") + '</div>';
+  if (!low.length && !none.length) side += '<div class="ok">' + (single ? 'Tous les critères sont notés 3 ou plus.' : 'Chaque critère atteint 3 dans au moins un projet.') + '</div>';
+  const head = opts.title ? '<div class="head">' + (opts.kicker ? '<div class="kicker">' + esc(opts.kicker) + '</div>' : '') + '<h2>' + esc(opts.title.replace(/^Couverture/, "Évaluation")) + '</h2>' + (opts.subtitle ? '<div class="sub">' + esc(opts.subtitle.replace("dispositif", "projet")) + '</div>' : '') + '</div>' : '';
+  app.innerHTML = head + '<div id="chart">' + g + '</div><div id="side">' + side + '</div>';
+}
+
+function render(records, opts) {
+  opts = opts || {}; const single = !!opts.single;
+  if (GRILLE && records && records.length) return renderGrille(records, opts);
+  const app = document.getElementById("app");
+  if (!records || !records.length) {
+    app.innerHTML = '<div id="msg">Sélectionnez un BEF pour afficher sa couverture.</div>'; return;
+  }
+  const axes = Object.keys(records[0]).filter(k => k.startsWith(PREFIX));
+  if (axes.length < 3) {
+    app.innerHTML = '<div id="msg">Il faut au moins 3 colonnes dont l\'identifiant commence par « ' + PREFIX + ' » dans la table.</div>'; return;
+  }
+  const n = axes.length, cx = 300, cy = 235, R = 150;
+  const ang = i => -Math.PI / 2 + (2 * Math.PI * i) / n;
+  const pt = (i, r) => [cx + r * Math.cos(ang(i)), cy + r * Math.sin(ang(i))];
+  const poly = vals => vals.map((v, i) => pt(i, R * v).map(x => x.toFixed(1)).join(",")).join(" ");
+
+  const projects = records.map((r, idx) => ({
+    name: r.Legende || ("Projet " + (r.id ?? idx + 1)),
+    vals: axes.map(a => num(r[a])), color: COLORS[idx % COLORS.length]
+  }));
+  const union = axes.map((_, i) => Math.max(...projects.map(p => p.vals[i])));
+  const covered = union.filter(v => v >= 1).length;
+  const partial = axes.filter((_, i) => union[i] > 0 && union[i] < 1).map(label);
+  const gaps = axes.filter((_, i) => !union[i]).map(label);
+
+  let s = '<svg viewBox="0 0 600 470" role="img" aria-label="Radar de couverture : ' + covered + ' critères sur ' + n + '">';
+  // grille
+  [0.5, 1].forEach(f => { s += '<polygon points="' + poly(Array(n).fill(f)) + '" fill="none" stroke="var(--grid)" stroke-width="1"' + (f < 1 ? ' stroke-dasharray="3 4"' : '') + '/>'; });
+  axes.forEach((_, i) => { const [x, y] = pt(i, R); s += '<line x1="' + cx + '" y1="' + cy + '" x2="' + x.toFixed(1) + '" y2="' + y.toFixed(1) + '" stroke="var(--grid)"/>'; });
+  // projets (en mode « projet unique », un seul tracé : celui du projet)
+  if (!single) projects.forEach(p => { s += '<polygon points="' + poly(p.vals) + '" fill="' + p.color + '" fill-opacity=".14" stroke="' + p.color + '" stroke-width="1.6" stroke-linejoin="round"/>'; });
+  // couverture du BEF (trait épais)
+  s += '<polygon points="' + poly(union) + '" fill="' + (single ? '#1b6ca8" fill-opacity=".16' : 'none') + '" stroke="var(--ink)" stroke-width="3.2" stroke-linejoin="round"/>';
+  union.forEach((v, i) => { const [x, y] = pt(i, R * v); s += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + (v >= 1 ? 4.5 : (v > 0 ? 4 : 3)) + '" fill="' + (v >= 1 ? 'var(--ink)' : 'var(--bg)') + '" stroke="' + (v > 0 ? 'var(--ink)' : 'var(--bad)') + '" stroke-width="2"/>'; });
+  // libellés
+  axes.forEach((a, i) => {
+    const [x, y] = pt(i, R + 16), c = Math.cos(ang(i));
+    const anchor = Math.abs(c) < 0.2 ? "middle" : (c > 0 ? "start" : "end");
+    const dy = Math.sin(ang(i)) > 0.5 ? 10 : (Math.sin(ang(i)) < -0.5 ? -2 : 4);
+    s += '<text x="' + x.toFixed(1) + '" y="' + (y + dy).toFixed(1) + '" text-anchor="' + anchor + '"' + (union[i] ? '' : ' class="gap"') + '>' + esc(label(a)) + (union[i] >= 1 ? '' : (union[i] > 0 ? ' (partiel)' : ' ✗')) + '</text>';
+  });
+  s += '</svg>';
+
+  let side = '<div class="score">' + covered + '<small> / ' + n + (single ? ' critères remplis' : ' critères couverts') + '</small></div>';
+  if (!single) {
+    side += '<ul class="legend">';
+    projects.forEach(p => { side += '<li><span class="sw" style="border-color:' + p.color + '"></span>' + esc(p.name) + '</li>'; });
+    side += '<li><span class="sw" style="border-color:var(--ink);border-top-width:4px"></span><b>Couverture du BEF</b></li></ul>';
+  }
+  if (partial.length) side += '<div class="part">Partiellement : ' + partial.map(esc).join(", ") + '</div>';
+  side += gaps.length ? '<div class="miss">' + (single ? 'Non remplis : ' : 'Non couverts : ') + gaps.map(esc).join(", ") + '</div>' : (partial.length ? '' : '<div class="ok">Tous les critères sont ' + (single ? 'remplis.' : 'couverts.') + '</div>');
+
+  const head = opts.title ? '<div class="head">' + (opts.kicker ? '<div class="kicker">' + esc(opts.kicker) + '</div>' : '') + '<h2>' + esc(opts.title) + '</h2>' + (opts.subtitle ? '<div class="sub">' + esc(opts.subtitle) + '</div>' : '') + '</div>' : '';
+  app.innerHTML = head + '<div id="chart">' + s + '</div><div id="side">' + side + '</div>';
+}
+
+// Noms des BEF et des départements (pour le titre du radar), lus une seule fois.
+let metaPromise = null;
+const meta = () => metaPromise || (metaPromise = (async () => {
+  try {
+    const [b, d] = await Promise.all([grist.docApi.fetchTable("BEF"), grist.docApi.fetchTable("Departements")]);
+    const dep = {}; d.id.forEach((id, k) => dep[id] = d.Nom[k]);
+    const bef = {}; b.id.forEach((id, k) => bef[id] = { nom: b.Nom[k], dep: dep[b.Departement[k]] });
+    return bef;
+  } catch (e) { return {}; }
+})());
+async function titleFor(rows, single) {
+  const m = await meta();
+  const info = r => typeof r.BEF === "string" ? { nom: r.BEF } : (m[r.BEF] || {});
+  if (single) {
+    const r = rows[0], x = info(r);
+    const nom = x.nom || r.__bef, dep = x.dep || r.__dep;          // secours : noms transmis par Grist si les tables n'ont pas pu être lues
+    return { single: true, title: "Projet : " + (r.Legende || ("n°" + r.id)), kicker: [nom && ("BEF " + nom), dep].filter(Boolean).join(" — ") || "BEF non renseigné" };
+  }
+  if (new Set(rows.map(r => r.BEF)).size > 1) return { title: "Couverture — plusieurs BEF mélangés", subtitle: rows.length + " projets" };
+  const x = info(rows[0]);
+  return { title: "Couverture du BEF" + (x.nom ? " " + x.nom : ""), subtitle: [x.dep, rows.length + " dispositif" + (rows.length > 1 ? "s" : "")].filter(Boolean).join(" — ") };
+}
+let showSeq = 0;
+async function show(rows, single) {
+  const me = ++showSeq;
+  const opts = await titleFor(rows, single);
+  if (me === showSeq) render(rows, opts);
+}
+
+// ---- Mode « départements » (?mode=departements) : un radar avec une courbe par département ----
+// Valeur d'un axe = part des BEF du département qui couvrent le critère (100 % = tous les BEF du département,
+// y compris ceux qui n'ont déposé aucun projet). Un BEF couvre un critère si au moins un de ses projets le remplit.
+const DEPTS = /[?&]mode=departements\b/.test(location.search);
+function renderDepartements(deps, axes) {
+  const app = document.getElementById("app");
+  if (!deps.length || axes.length < 3) { app.innerHTML = '<div id="msg">Aucun département ou aucune colonne ' + PREFIX + '… à afficher.</div>'; return; }
+  const n = axes.length, cx = 300, cy = 235, R = 150;
+  const ang = i => -Math.PI / 2 + (2 * Math.PI * i) / n;
+  const pt = (i, r) => [cx + r * Math.cos(ang(i)), cy + r * Math.sin(ang(i))];
+  const poly = vals => vals.map((v, i) => pt(i, R * v).map(x => x.toFixed(1)).join(",")).join(" ");
+  let s = '<svg viewBox="0 0 600 470" role="img" aria-label="Couverture des critères par département">';
+  [0.25, 0.5, 0.75, 1].forEach(f => { s += '<polygon points="' + poly(Array(n).fill(f)) + '" fill="none" stroke="var(--grid)"' + (f < 1 ? ' stroke-dasharray="3 4"' : '') + '/>'; });
+  axes.forEach((_, i) => { const [x, y] = pt(i, R); s += '<line x1="' + cx + '" y1="' + cy + '" x2="' + x.toFixed(1) + '" y2="' + y.toFixed(1) + '" stroke="var(--grid)"/>'; });
+  deps.forEach((d, k) => { d.color = COLORS[k % COLORS.length];
+    s += '<polygon points="' + poly(d.ratios) + '" fill="' + d.color + '" fill-opacity=".10" stroke="' + d.color + '" stroke-width="2.4" stroke-linejoin="round"/>';
+    d.ratios.forEach((v, i) => { const [x, y] = pt(i, R * v); s += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="3.2" fill="' + d.color + '"/>'; });
+  });
+  axes.forEach((a, i) => {
+    const [x, y] = pt(i, R + 16), c = Math.cos(ang(i));
+    const anchor = Math.abs(c) < 0.2 ? "middle" : (c > 0 ? "start" : "end");
+    const dy = Math.sin(ang(i)) > 0.5 ? 10 : (Math.sin(ang(i)) < -0.5 ? -2 : 4);
+    s += '<text x="' + x.toFixed(1) + '" y="' + (y + dy).toFixed(1) + '" text-anchor="' + anchor + '">' + esc(label(a)) + '</text>';
+  });
+  s += '</svg>';
+  let side = '<ul class="legend">';
+  deps.forEach(d => { side += '<li class="dep"><span class="sw" style="border-color:' + d.color + '"></span><span>' + esc(d.nom) + ' <small>' + d.nBef + ' BEF</small></span><span class="pct">' + Math.round(d.mean * 100) + ' %</span></li>'; });
+  side += '</ul><div class="note">Pourcentage affiché : couverture moyenne des critères. Sur chaque axe, 100 % = tous les BEF du département couvrent le critère.</div>';
+  const head = '<div class="head"><h2>Couverture des critères par département</h2><div class="sub">Part des BEF de chaque département qui couvrent le critère</div></div>';
+  app.innerHTML = head + '<div id="chart">' + s + '</div><div id="side">' + side + '</div>';
+}
+let depSeq = 0;
+async function computeDepartements() {
+  const me = ++depSeq;
+  try {
+    const [dT, bT, cT] = await Promise.all([grist.docApi.fetchTable("Departements"), grist.docApi.fetchTable("BEF"), grist.docApi.fetchTable("Candidatures")]);
+    const axes = Object.keys(cT).filter(k => k.startsWith(PREFIX));
+    const best = {};                                                  // BEF -> valeur maximale par axe sur ses projets
+    for (let i = 0; i < cT.id.length; i++) {
+      const b = cT.BEF[i]; if (b == null) continue;
+      const cur = best[b] || (best[b] = axes.map(() => 0));
+      axes.forEach((a, k) => { cur[k] = Math.max(cur[k], num(cT[a][i])); });
+    }
+    const deps = [];
+    dT.id.forEach((id, k) => {
+      const befs = bT.id.filter((_, j) => bT.Departement[j] === id);
+      if (!befs.length) return;
+      const ratios = axes.map((_, a) => befs.reduce((sum, b) => sum + ((best[b] || [])[a] || 0), 0) / befs.length);
+      deps.push({ nom: dT.Nom[k], nBef: befs.length, ratios, mean: ratios.reduce((x, y) => x + y, 0) / ratios.length });
+    });
+    deps.sort((x, y) => String(x.nom).localeCompare(String(y.nom), "fr"));
+    if (me === depSeq) { status("départements · " + deps.length + " dép. · " + (bT.id.length) + " BEF"); renderDepartements(deps, axes); }
+  } catch (e) { if (me === depSeq) fail(e); }
+}
+
+// ---- Mode « un département » (?mode=departement) : un département choisi, un BEF par courbe ----
+const DEPT1 = /[?&]mode=departement\b/.test(location.search);
+let dep1Seq = 0;
+async function computeDepartement(depId) {
+  const me = ++dep1Seq, app = document.getElementById("app");
+  try {
+    const [dT, bT, cT] = await Promise.all([grist.docApi.fetchTable("Departements"), grist.docApi.fetchTable("BEF"), grist.docApi.fetchTable("Candidatures")]);
+    const k = dT.id.indexOf(depId);
+    if (k < 0) { app.innerHTML = '<div id="msg">Choisissez un département.</div>'; return; }
+    const axes = Object.keys(cT).filter(a => a.startsWith(PREFIX));
+    const befs = [];
+    bT.id.forEach((id, j) => { if (bT.Departement[j] !== depId) return;
+      const v = axes.map(() => 0); let nb = 0;
+      for (let i = 0; i < cT.id.length; i++) if (cT.BEF[i] === id) { nb++; axes.forEach((a, x) => { v[x] = Math.max(v[x], num(cT[a][i])); }); }
+      befs.push({ nom: bT.Nom[j], nb, v }); });
+    if (me !== dep1Seq) return;
+    status("département · " + dT.Nom[k] + " · " + befs.length + " BEF");
+    if (!befs.length || axes.length < 3) { app.innerHTML = '<div id="msg">Aucun BEF ou aucune colonne ' + PREFIX + '… à afficher.</div>'; return; }
+    befs.sort((x, y) => String(x.nom).localeCompare(String(y.nom), "fr"));
+    const ratios = axes.map((_, a) => befs.reduce((t, b) => t + b.v[a], 0) / befs.length);
+    const n = axes.length, cx = 300, cy = 235, R = 150;
+    const ang = i => -Math.PI / 2 + (2 * Math.PI * i) / n;
+    const pt = (i, r) => [cx + r * Math.cos(ang(i)), cy + r * Math.sin(ang(i))];
+    const poly = vals => vals.map((v, i) => pt(i, R * v).map(x => x.toFixed(1)).join(",")).join(" ");
+    let g = '<svg viewBox="0 0 600 470" role="img" aria-label="Couverture des critères du département">';
+    [0.25, 0.5, 0.75, 1].forEach(f => { g += '<polygon points="' + poly(Array(n).fill(f)) + '" fill="none" stroke="var(--grid)"' + (f < 1 ? ' stroke-dasharray="3 4"' : '') + '/>'; });
+    axes.forEach((_, i) => { const [x, y] = pt(i, R); g += '<line x1="' + cx + '" y1="' + cy + '" x2="' + x.toFixed(1) + '" y2="' + y.toFixed(1) + '" stroke="var(--grid)"/>'; });
+    befs.forEach((b, i) => { b.color = COLORS[i % COLORS.length];
+      g += '<polygon points="' + poly(b.v) + '" fill="' + b.color + '" fill-opacity=".08" stroke="' + b.color + '" stroke-width="1.6" stroke-linejoin="round"/>'; });
+    g += '<polygon points="' + poly(ratios) + '" fill="none" stroke="var(--ink)" stroke-width="3.6" stroke-linejoin="round"/>';
+    ratios.forEach((v, i) => { const [x, y] = pt(i, R * v); g += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="4" fill="var(--ink)"/>'; });
+    axes.forEach((a, i) => {
+      const [x, y] = pt(i, R + 16), c = Math.cos(ang(i)), full = ratios[i] >= 0.999;
+      const anchor = Math.abs(c) < 0.2 ? "middle" : (c > 0 ? "start" : "end");
+      const dy = Math.sin(ang(i)) > 0.5 ? 10 : (Math.sin(ang(i)) < -0.5 ? -2 : 4);
+      g += '<text x="' + x.toFixed(1) + '" y="' + (y + dy).toFixed(1) + '" text-anchor="' + anchor + '"' + (full ? '' : ' fill="#b3261e" font-weight="600"') + '>' + esc(label(a)) + (full ? '' : ' ' + Math.round(ratios[i] * befs.length * 2) / 2 + '/' + befs.length) + '</text>';
+    });
+    g += '</svg>';
+    const nFull = ratios.filter(r => r >= 0.999).length;
+    let side = '<div class="score">' + nFull + '<small> / ' + n + ' critères couverts par tous les BEF</small></div><ul class="legend">';
+    befs.forEach(b => { side += '<li><span class="sw" style="border-color:' + b.color + '"></span>' + esc(b.nom) + ' <small>' + (b.nb ? b.nb + ' projet' + (b.nb > 1 ? 's' : '') : 'aucun projet') + '</small></li>'; });
+    side += '<li><span class="sw" style="border-color:var(--ink);border-top-width:4px"></span><b>Couverture du département</b></li></ul>';
+    const gaps = axes.map((a, i) => [a, ratios[i]]).filter(x => x[1] < 0.999);
+    side += gaps.length ? '<div class="miss">Non couverts par tous les BEF : ' + gaps.map(x => esc(label(x[0])) + ' (' + Math.round(x[1] * befs.length * 2) / 2 + '/' + befs.length + ')').join(", ") + '</div>' : '<div class="ok">Tous les critères sont couverts par tous les BEF.</div>';
+    const head = '<div class="head"><h2>Couverture du département ' + esc(dT.Nom[k]) + '</h2><div class="sub">' + befs.length + ' BEF · courbe épaisse = part des BEF qui couvrent chaque critère</div></div>';
+    app.innerHTML = head + '<div id="chart">' + g + '</div><div id="side">' + side + '</div>';
+  } catch (e) { if (me === dep1Seq) fail(e); }
+}
+
+// Deux modes de fonctionnement :
+//  A) table Candidatures, liée par « Sélectionner par » : Grist envoie déjà les projets filtrés ;
+//  B) table de synthèse « Candidatures_summary_… » (regroupée par Departement, BEF), liée au tableau de BEF :
+//     la page lit la ligne sélectionnée puis récupère elle-même les projets du BEF (accès complet requis).
+// Une ligne de synthèse se reconnaît au nom de la table ou, à défaut, à l'absence de la colonne texte « Legende ».
+const VERSION = "v15";
+const SUMMARY_FALLBACK = "Candidatures_summary_BEF_Departement";
+grist.ready({ requiredAccess: "full" });
+
+let tableIdPromise = null;
+function getTableId() {
+  if (!tableIdPromise) tableIdPromise = (async () => {
+    try { const id = await grist.selectedTable.getTableId(); if (id) return id; } catch (e) {}
+    try { const id = await grist.getTable().getTableId(); if (id) return id; } catch (e) {}
+    return "";
+  })();
+  return tableIdPromise;
+}
+const hasAxes = r => r && Object.keys(r).some(k => k.startsWith(PREFIX));
+const isSummaryRow = (r, tid) => /_summary_/i.test(tid || "") || (r && !("Legende" in r));
+const fail = e => { document.getElementById("app").innerHTML = '<div id="msg">Impossible de lire les données : ' + esc((e && e.message) || e) + '</div>'; };
+if (/[?&]debug\b/.test(location.search)) document.getElementById("ver").style.display = "block";
+const status = t => { document.getElementById("ver").textContent = VERSION + " · " + t; };
+
+let seqA = 0;
+const SINGLE = /[?&]mode=projet\b/.test(location.search);   // ?mode=projet : un seul projet (la ligne sélectionnée)
+grist.onRecords(async rows => {
+  if (DEPT1) return;
+  if (DEPTS) { computeDepartements(); return; }
+  if (SINGLE) return;
+  const tid = await getTableId();
+  if (rows && rows.length && isSummaryRow(rows[0], tid)) return;     // mode B : géré par onRecord
+  const me = ++seqA;
+  status("A · " + (tid || "table ?"));
+  if (!rows || !rows.length) { render([]); return; }
+  let out = rows;
+  try {                                                               // Grist n'envoie que les colonnes affichées dans le widget :
+    const t = await grist.docApi.fetchTable(tid || "Candidatures");   // on relit donc les lignes complètes (toutes les colonnes R_…)
+    const wanted = new Set(rows.map(r => r.id)), keys = Object.keys(t), full = [];
+    for (let i = 0; i < t.id.length; i++) {
+      if (!wanted.has(t.id[i])) continue;
+      const row = {}; keys.forEach(k => row[k] = t[k][i]); full.push(row);
+    }
+    if (full.length) out = full;
+  } catch (e) { /* accès limité : on garde les colonnes reçues */ }
+  if (me !== seqA) return;
+  if (out.some(r => hasAxes(r))) show(out); else render([]);
+});
+
+let seq = 0;
+// Grist transmet au widget le NOM d'une colonne de référence (« BRD »), alors que les tables stockent un NUMÉRO.
+// On lit donc les numéros dans la table de synthèse ; à défaut, on compare par nom.
+grist.onRecord(async rec => {
+  if (DEPTS) return;
+  const tid = await getTableId();
+  if (DEPT1) {                                                        // mode département : table Departements, ou synthèse par département
+    if (!rec || rec.id == null) { document.getElementById("app").innerHTML = '<div id="msg">Choisissez un département.</div>'; return; }
+    let depId = rec.id;
+    if (/_summary_/i.test(tid || "")) {
+      try { const t = await grist.docApi.fetchTable(tid), i = t.id.indexOf(rec.id); depId = i < 0 ? null : t.Departement[i]; } catch (e) { depId = null; }
+    }
+    computeDepartement(depId); return;
+  }
+  if (SINGLE) {                                                       // mode projet unique : widget sur la table Candidatures
+    if (/_summary_/i.test(tid)) { document.getElementById("app").innerHTML = '<div id="msg">Mode projet : branchez ce widget sur la table Candidatures (et non sur une table de synthèse).</div>'; return; }
+    if (!rec || rec.id == null) { render([]); return; }
+    status("projet · " + (tid || "Candidatures") + " · ligne " + rec.id);
+    try {
+      const t = await grist.docApi.fetchTable(tid || "Candidatures"), i = t.id.indexOf(rec.id);
+      if (i < 0) { render([]); return; }
+      const row = {}; Object.keys(t).forEach(k => row[k] = t[k][i]);
+      if (typeof rec.BEF === "string") row.__bef = rec.BEF;           // noms éventuellement transmis par Grist
+      if (typeof rec.Departement === "string") row.__dep = rec.Departement;
+      show([row], true);
+    } catch (e) { fail(e); }
+    return;
+  }
+  if (!rec || !isSummaryRow(rec, tid)) return;                        // mode A : géré par onRecords
+  const me = ++seq, sumId = /_summary_/i.test(tid) ? tid : SUMMARY_FALLBACK;
+  const info = "B · " + sumId + " · ligne " + rec.id;
+  status(info + " · lecture…");
+  if (rec.id == null) { render([]); return; }
+  try {
+    const [summary, t] = await Promise.all([grist.docApi.fetchTable(sumId), grist.docApi.fetchTable("Candidatures")]);
+    const at = summary.id.indexOf(rec.id);
+    let match;
+    if (at >= 0 && summary.BEF && summary.BEF[at] != null) {
+      const befId = summary.BEF[at];
+      match = i => t.BEF[i] === befId;
+      var what = "BEF n°" + befId;
+    } else {                                                           // secours : comparaison par nom
+      const befT = await grist.docApi.fetchTable("BEF");
+      const nameOf = {}; befT.id.forEach((id, k) => nameOf[id] = befT.Nom[k]);
+      match = i => nameOf[t.BEF[i]] === rec.BEF;
+      var what = "BEF « " + rec.BEF + " »";
+    }
+    const keys = Object.keys(t), out = [];
+    for (let i = 0; i < t.id.length; i++) {
+      if (!match(i)) continue;
+      const row = {}; keys.forEach(k => row[k] = t[k][i]); out.push(row);
+    }
+    if (me !== seq) return;
+    status(info + " · " + what + " · " + out.length + " projet(s) sur " + t.id.length);
+    if (!out.length) { document.getElementById("app").innerHTML = '<div id="msg">Aucun projet trouvé pour ce BEF.</div>'; return; }
+    show(out);
+  } catch (e) { if (me === seq) { status(info + " · erreur"); fail(e); } }
+});
+status("en attente");
+if (DEPTS) computeDepartements();
+</script>
+</body>
+</html>
